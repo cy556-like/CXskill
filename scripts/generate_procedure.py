@@ -103,6 +103,93 @@ def find_template(agent_id=None, documents_dir=None):
     return None, False, None, None
 
 
+def find_all_templates(agent_id=None, documents_dir=None):
+    """查找所有程序文件模板（收集所有部门的所有文件）
+
+    查找逻辑：
+    1. 企业内部文件 agent_{id}/程序文件/ → 递归搜索所有子目录和文件
+    2. 全质知识库 external_kb/体系文件/程序文件/ → 递归搜索所有子目录和文件
+    3. 按部门去重：如果企业内部文件有某部门的模板，全质知识库的同部门模板跳过
+
+    返回 list of dict:
+    [
+      {"path": Path, "need_convert": bool, "source": "internal"/"external",
+       "dept": "部门名", "filename": "文件名"},
+      ...
+    ]
+    """
+    if documents_dir is None:
+        candidate = SKILL_ROOT.parent.parent / "data" / "documents"
+        if candidate.exists():
+            documents_dir = candidate
+        else:
+            documents_dir = SKILL_ROOT.parent / "data" / "documents"
+    else:
+        documents_dir = Path(documents_dir)
+
+    print(f"[INFO] find_all_templates: documents_dir={documents_dir}, agent_id={agent_id}")
+
+    # 收集企业内部文件
+    internal_templates = []
+    if agent_id:
+        proc_dir = documents_dir / f"agent_{agent_id}" / "程序文件"
+        print(f"[INFO] 查找企业内部文件: {proc_dir} (exists={proc_dir.exists()})")
+        if proc_dir.exists():
+            for root, dirs, files in os.walk(str(proc_dir)):
+                for f in sorted(files):
+                    if f.startswith('~$'):
+                        continue
+                    ext = f.lower().rsplit('.', 1)[-1] if '.' in f else ''
+                    if ext in ('docx', 'doc'):
+                        rel = os.path.relpath(root, str(proc_dir))
+                        # 部门名取第一级子目录（如"质量部二级"），如果文件直接在根目录则 dept="通用"
+                        parts = rel.replace('\\', '/').split('/')
+                        dept = parts[0] if parts and parts[0] != '.' else '通用'
+                        internal_templates.append({
+                            "path": Path(root) / f,
+                            "need_convert": (ext == 'doc'),
+                            "source": 'internal',
+                            "dept": dept,
+                            "filename": f
+                        })
+                        print(f"[INFO] 企业内部文件: {dept}/{f} (source=internal)")
+
+    # 收集全质知识库
+    ext_templates = []
+    ext_proc_dir = documents_dir / "external_kb" / "体系文件" / "程序文件"
+    print(f"[INFO] 查找全质知识库: {ext_proc_dir} (exists={ext_proc_dir.exists()})")
+    if ext_proc_dir.exists():
+        for root, dirs, files in os.walk(str(ext_proc_dir)):
+            for f in sorted(files):
+                if f.startswith('~$'):
+                    continue
+                ext = f.lower().rsplit('.', 1)[-1] if '.' in f else ''
+                if ext in ('docx', 'doc'):
+                    rel = os.path.relpath(root, str(ext_proc_dir))
+                    parts = rel.replace('\\', '/').split('/')
+                    dept = parts[0] if parts and parts[0] != '.' else '通用'
+                    ext_templates.append({
+                        "path": Path(root) / f,
+                        "need_convert": (ext == 'doc'),
+                        "source": 'external',
+                        "dept": dept,
+                        "filename": f
+                    })
+                    print(f"[INFO] 全质知识库: {dept}/{f} (source=external)")
+
+    # 按部门去重：企业内部文件的部门优先
+    internal_depts = set(t["dept"] for t in internal_templates)
+    # 全质知识库里只保留企业内部文件没有的部门
+    filtered_ext = [t for t in ext_templates if t["dept"] not in internal_depts]
+
+    all_templates = internal_templates + filtered_ext
+    print(f"[INFO] 总计找到 {len(all_templates)} 个模板（企业内部 {len(internal_templates)} + 全质知识库 {len(filtered_ext)}）")
+    for t in all_templates:
+        print(f"  - [{t['source']}] {t['dept']}/{t['filename']}")
+
+    return all_templates
+
+
 def convert_doc_to_docx(doc_path):
     """用 LibreOffice 把 .doc 转成 .docx"""
     tmp_dir = tempfile.mkdtemp(prefix='doc2docx_')
