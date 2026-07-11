@@ -177,13 +177,10 @@ def find_all_templates(agent_id=None, documents_dir=None):
                     })
                     print(f"[INFO] 全质知识库: {dept}/{f} (source=external)")
 
-    # 按部门去重：企业内部文件的部门优先
-    internal_depts = set(t["dept"] for t in internal_templates)
-    # 全质知识库里只保留企业内部文件没有的部门
-    filtered_ext = [t for t in ext_templates if t["dept"] not in internal_depts]
-
-    all_templates = internal_templates + filtered_ext
-    print(f"[INFO] 总计找到 {len(all_templates)} 个模板（企业内部 {len(internal_templates)} + 全质知识库 {len(filtered_ext)}）")
+    # 不再按部门整体去重，改为返回所有模板
+    # 同部门去重逻辑交给 API 层用 AI 智能判断（按文件内容主题匹配，而非按部门整体跳过）
+    all_templates = internal_templates + ext_templates
+    print(f"[INFO] 总计找到 {len(all_templates)} 个模板（企业内部 {len(internal_templates)} + 全质知识库 {len(ext_templates)}）")
     for t in all_templates:
         print(f"  - [{t['source']}] {t['dept']}/{t['filename']}")
 
