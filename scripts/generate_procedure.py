@@ -400,11 +400,10 @@ def build_llm_prompt(overview_text, survey_text, template_filename):
         "    - 人名必须填入对应位置\n"
         "13. 优先使用 global_replace 做简单替换（如公司名、日期、编号中的AAA），只在需要整段重写时用 paragraph。\n"
         "14. 特别是 global_replace 要覆盖所有 AAA 变体：AAA、AAA企业、山东AAA 等，全部替换为用户公司名。\n"
-        "15. 【封面表格保护 - 极其重要】不要在封面表格（Table 0）的'实施日期/制订/审查/批准'行下方的空单元格中填写任何内容：\n"
-        "    - 这些空单元格是留待打印后手写签字的位置，必须保持空白\n"
-        "    - 不要填入日期、不要填入人名（即使调研数据有这些信息）\n"
-        "    - 填入内容会破坏表格布局，导致'文件修订对照表'位置错乱\n"
-        "    - 公司名、文件编号等已有内容的单元格可以正常替换\n"
+        "15. 【封面表格填写】可以往封面表格（Table 0）的'实施日期/制订/审查/批准'下方的空单元格填写内容：\n"
+        "    - 实施日期下方填入当前日期（如 2026年7月11日）\n"
+        "    - 制订/审查/批准下方填入对应人名（从调研数据获取）\n"
+        "    - 填写内容简短即可，不要换行\n"
         "16. 【页眉页脚保护】不要删除或清空页眉页脚中的任何内容，只做替换：\n"
         "    - 页眉中的公司名、文件编号、文件名称、版次、类别、页次等必须保留\n"
         "    - 只用 header_replace 替换其中的 AAA/公司名/编号，不要用 paragraph 清空页眉\n"
@@ -542,7 +541,15 @@ def apply_paragraph_replace(doc, index, new_text):
     if index < 0 or index >= len(doc.paragraphs):
         print(f"[WARN] 段落索引 {index} 越界")
         return False
-    set_paragraph_text(doc.paragraphs[index], new_text)
+    p = doc.paragraphs[index]
+    # 【节分界段落保护】如果段落含 sectPr（节分界符），禁止修改内容
+    # 节分界段落必须保持空白，填入内容会导致节属性错乱、页眉引用丢失、空白页
+    from docx.oxml.ns import qn
+    pPr = p._element.find(qn('w:pPr'))
+    if pPr is not None and pPr.find(qn('w:sectPr')) is not None:
+        print(f"[INFO] 跳过节分界段落 P{index}（含 sectPr，禁止修改）")
+        return False
+    set_paragraph_text(p, new_text)
     return True
 
 
@@ -559,19 +566,6 @@ def apply_table_cell_replace(doc, table_idx, row_idx, col_idx, new_text):
         print(f"[WARN] 列索引 {col_idx} 越界")
         return False
     cell = row.cells[col_idx]
-    
-    # 【封面表格保护】禁止往封面表格（Table 0）的空单元格填内容
-    # 原因：封面表格的"实施日期/制订/审查/批准"下方是空白的签字行，
-    # 留待打印后手写签字。AI 填入日期/人名会导致：
-    # 1. 内容溢出单元格（exact 规则）或撑高行高（atLeast 规则）
-    # 2. 把"文件修订对照表"挤到错误位置，页眉引用错乱
-    # 所以必须保持空白
-    if table_idx == 0:
-        old_text = cell.text.strip()
-        if not old_text:
-            print(f"[INFO] 跳过封面表格空单元格 [{row_idx},{col_idx}]（签字行，保持空白）")
-            return False
-    
     if cell.paragraphs:
         set_paragraph_text(cell.paragraphs[0], new_text)
         for p in cell.paragraphs[1:]:
