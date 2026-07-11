@@ -400,6 +400,14 @@ def build_llm_prompt(overview_text, survey_text, template_filename):
         "    - 人名必须填入对应位置\n"
         "13. 优先使用 global_replace 做简单替换（如公司名、日期、编号中的AAA），只在需要整段重写时用 paragraph。\n"
         "14. 特别是 global_replace 要覆盖所有 AAA 变体：AAA、AAA企业、山东AAA 等，全部替换为用户公司名。\n"
+        "15. 【封面表格保护 - 极其重要】不要在封面表格（Table 0）的'实施日期/制订/审查/批准'行下方的空单元格中填写任何内容：\n"
+        "    - 这些空单元格是留待打印后手写签字的位置，必须保持空白\n"
+        "    - 不要填入日期、不要填入人名（即使调研数据有这些信息）\n"
+        "    - 实施日期、制订人、审查人、批准人的姓名如果需要填写，应该用 global_replace 替换模板中已有的占位符，而不是填入空单元格\n"
+        "    - 如果模板的封面表格 Row 2 是空行，禁止往里面填内容\n"
+        "16. 【页眉页脚保护】不要删除或清空页眉页脚中的任何内容，只做替换：\n"
+        "    - 页眉中的公司名、文件编号、文件名称、版次、类别、页次等必须保留\n"
+        "    - 只用 header_replace 替换其中的 AAA/公司名/编号，不要用 paragraph 清空页眉\n"
     )
 
     user = (
@@ -551,6 +559,15 @@ def apply_table_cell_replace(doc, table_idx, row_idx, col_idx, new_text):
         print(f"[WARN] 列索引 {col_idx} 越界")
         return False
     cell = row.cells[col_idx]
+    
+    # 【封面表格保护】禁止往封面表格（Table 0）的空单元格填内容
+    # 空单元格是留待手写签字的位置，填入内容会导致表格高度变化、页面错乱
+    if table_idx == 0:
+        old_text = cell.text.strip()
+        if not old_text:
+            print(f"[WARN] 拒绝修改封面表格空单元格 [{row_idx},{col_idx}]（手写签字位置，禁止填充）")
+            return False
+    
     if cell.paragraphs:
         set_paragraph_text(cell.paragraphs[0], new_text)
         for p in cell.paragraphs[1:]:
