@@ -400,11 +400,11 @@ def build_llm_prompt(overview_text, survey_text, template_filename):
         "    - 人名必须填入对应位置\n"
         "13. 优先使用 global_replace 做简单替换（如公司名、日期、编号中的AAA），只在需要整段重写时用 paragraph。\n"
         "14. 特别是 global_replace 要覆盖所有 AAA 变体：AAA、AAA企业、山东AAA 等，全部替换为用户公司名。\n"
-        "15. 【封面表格保护 - 极其重要】不要在封面表格（Table 0）的'实施日期/制订/审查/批准'行下方的空单元格中填写任何内容：\n"
-        "    - 这些空单元格是留待打印后手写签字的位置，必须保持空白\n"
-        "    - 不要填入日期、不要填入人名（即使调研数据有这些信息）\n"
-        "    - 实施日期、制订人、审查人、批准人的姓名如果需要填写，应该用 global_replace 替换模板中已有的占位符，而不是填入空单元格\n"
-        "    - 如果模板的封面表格 Row 2 是空行，禁止往里面填内容\n"
+        "15. 【封面表格填写规则】可以往封面表格（Table 0）的'实施日期/制订/审查/批准'下方的空单元格填写内容：\n"
+        "    - 实施日期下方填入当前日期（简短格式，如 2026年7月11日）\n"
+        "    - 制订/审查/批准下方填入对应人名（从调研数据获取）\n"
+        "    - 填写内容必须简短，不要换行，不要加多余文字\n"
+        "    - 行高会被代码自动锁定，不用担心内容撑高表格\n"
         "16. 【页眉页脚保护】不要删除或清空页眉页脚中的任何内容，只做替换：\n"
         "    - 页眉中的公司名、文件编号、文件名称、版次、类别、页次等必须保留\n"
         "    - 只用 header_replace 替换其中的 AAA/公司名/编号，不要用 paragraph 清空页眉\n"
@@ -560,13 +560,18 @@ def apply_table_cell_replace(doc, table_idx, row_idx, col_idx, new_text):
         return False
     cell = row.cells[col_idx]
     
-    # 【封面表格保护】禁止往封面表格（Table 0）的空单元格填内容
-    # 空单元格是留待手写签字的位置，填入内容会导致表格高度变化、页面错乱
+    # 【封面表格行高保护】填充内容前记录原行高，填充后恢复
+    # 防止填入内容导致行高自动增长，把后续内容挤到下一页
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    saved_heights = {}
     if table_idx == 0:
-        old_text = cell.text.strip()
-        if not old_text:
-            print(f"[WARN] 拒绝修改封面表格空单元格 [{row_idx},{col_idx}]（手写签字位置，禁止填充）")
-            return False
+        for r_idx, r in enumerate(t.rows):
+            trPr = r._tr.find(qn('w:trPr'))
+            if trPr is not None:
+                h = trPr.find(qn('w:trHeight'))
+                if h is not None:
+                    saved_heights[r_idx] = (h.get(qn('w:val')), h.get(qn('w:hRule')))
     
     if cell.paragraphs:
         set_paragraph_text(cell.paragraphs[0], new_text)
@@ -575,6 +580,22 @@ def apply_table_cell_replace(doc, table_idx, row_idx, col_idx, new_text):
                 r.text = ''
     else:
         cell.text = str(new_text)
+    
+    # 恢复原行高（强制使用 exact 规则，防止内容撑高行）
+    if table_idx == 0 and saved_heights:
+        for r_idx, (h_val, h_rule) in saved_heights.items():
+            trPr = t.rows[r_idx]._tr.find(qn('w:trPr'))
+            if trPr is None:
+                trPr = OxmlElement('w:trPr')
+                t.rows[r_idx]._tr.insert(0, trPr)
+            h = trPr.find(qn('w:trHeight'))
+            if h is None:
+                h = OxmlElement('w:trHeight')
+                trPr.append(h)
+            h.set(qn('w:val'), h_val)
+            # 改为 exact 规则，强制行高不变（内容超出会被截断，但保证布局）
+            h.set(qn('w:hRule'), 'exact')
+    
     return True
 
 
