@@ -165,6 +165,11 @@ def find_all_templates(agent_id=None, documents_dir=None):
                     continue
                 ext = f.lower().rsplit('.', 1)[-1] if '.' in f else ''
                 if ext in ('docx', 'doc'):
+                    # [需求] 全质知识库模板只使用 AAA/aaa 命名的文件
+                    # AAB、AAC 等是其他公司的模板，不用于生成
+                    if 'AAA' not in f and 'aaa' not in f:
+                        print(f"[INFO] 跳过非AAA模板: {f}")
+                        continue
                     rel = os.path.relpath(root, str(ext_proc_dir))
                     parts = rel.replace('\\', '/').split('/')
                     dept = parts[0] if parts and parts[0] != '.' else '通用'
