@@ -341,6 +341,7 @@ def format_survey_for_llm(survey):
         'sv_quality_policy': '质量方针', 'sv_quality_goal': '质量目标',
         'sv_design_dev': '有无设计开发', 'sv_filler_name': '填写人',
         'sv_certs': '已有证书', 'sv_org': '机构设置',
+        'sv_org_custom_rows': '自定义部门',
     }
     lines = ["=== 用户体系调研数据 ==="]
     for key, label in field_labels.items():
