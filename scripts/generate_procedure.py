@@ -383,13 +383,126 @@ def format_survey_for_llm(survey):
 
 
 # ===================================================================
+# 2.5 实施日期计算（与 SCskill/generate_manual.py 逻辑完全一致）
+# ===================================================================
+
+def _parse_date(date_str):
+    """将各种格式的日期字符串解析为 datetime 对象，失败返回 None。
+    支持: 2024年3月15日, 2024-03-15, 2024/03/15, 2024.03.15, ISO格式"""
+    if not date_str or not isinstance(date_str, str):
+        return None
+    date_str = date_str.strip()
+    if not date_str:
+        return None
+    formats = [
+        '%Y年%m月%d日', '%Y-%m-%d', '%Y/%m/%d', '%Y.%m.%d',
+        '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y年%m月%d日 %H:%M:%S',
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    m = re.search(r'(\d{4})\D+(\d{1,2})\D+(\d{1,2})', date_str)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def _contains_16949(certs):
+    """判断证书列表中是否包含 IATF 16949"""
+    if not certs:
+        return False
+    if isinstance(certs, str):
+        return '16949' in certs
+    if isinstance(certs, (list, tuple)):
+        for c in certs:
+            if isinstance(c, str) and '16949' in c:
+                return True
+    return False
+
+
+def _subtract_months(dt, months):
+    """从日期减去指定月数，返回新的 datetime。自动处理月末溢出（如 3月31日 - 1月 = 2月28/29日）。"""
+    import calendar
+    total_months = dt.year * 12 + dt.month - 1 - months
+    new_year = total_months // 12
+    new_month = total_months % 12 + 1
+    max_day = calendar.monthrange(new_year, new_month)[1]
+    new_day = min(dt.day, max_day)
+    return dt.replace(year=new_year, month=new_month, day=new_day)
+
+
+def calculate_implementation_date(survey):
+    """根据证书类型和第一阶段开始时间，计算程序文件实施日期（与手册保持一致）。
+
+    逻辑（与 SCskill 完全一致，确保体系文件时间基准统一）：
+    - 证书含 IATF 16949:
+      - 未填写第一阶段开始时间 → 计划取得认证证书日期 - 18个月
+      - 已填写第一阶段开始时间 → 第一阶段开始时间 - 15个月
+    - 非 16949（如 ISO 9001）:
+      - 未填写第一阶段开始时间 → 计划取得认证证书日期 - 5个月
+      - 已填写第一阶段开始时间 → 第一阶段开始时间 - 4个月
+
+    返回 (implementation_date_str, description_str)
+    implementation_date_str 格式: "2024年3月15日"
+    """
+    certs = survey.get('sv_certs', [])
+    is_16949 = _contains_16949(certs)
+
+    audit_date_str = (survey.get('sv_audit_date') or '').strip()
+    cert_date_str = (survey.get('sv_cert_date') or '').strip()
+
+    audit_date = _parse_date(audit_date_str)
+    cert_date = _parse_date(cert_date_str)
+
+    if is_16949:
+        if audit_date:
+            impl_date = _subtract_months(audit_date, 15)
+            desc = f"IATF 16949认证，第一阶段开始时间={audit_date_str}，向前推15个月作为程序文件实施日期"
+        elif cert_date:
+            impl_date = _subtract_months(cert_date, 18)
+            desc = f"IATF 16949认证，计划取得认证证书日期={cert_date_str}，向前推18个月作为程序文件实施日期"
+        else:
+            today = datetime.now()
+            impl_date = today
+            desc = "IATF 16949认证，但认证日期和第一阶段开始时间均未填写，回退使用当前日期"
+    else:
+        if audit_date:
+            impl_date = _subtract_months(audit_date, 4)
+            desc = f"非16949认证，第一阶段开始时间={audit_date_str}，向前推4个月作为程序文件实施日期"
+        elif cert_date:
+            impl_date = _subtract_months(cert_date, 5)
+            desc = f"非16949认证，计划取得认证证书日期={cert_date_str}，向前推5个月作为程序文件实施日期"
+        else:
+            today = datetime.now()
+            impl_date = today
+            desc = "非16949认证，但认证日期和第一阶段开始时间均未填写，回退使用当前日期"
+
+    impl_date_str = f"{impl_date.year}年{impl_date.month}月{impl_date.day}日"
+    return impl_date_str, desc
+
+
+# ===================================================================
 # 3. 构造 LLM 提示词（NDJSON 流式输出）
 # ===================================================================
 
-def build_llm_prompt(overview_text, survey_text, template_filename):
+def build_llm_prompt(overview_text, survey_text, template_filename, survey=None):
     today = datetime.now()
     today_str = f"{today.year}年{today.month}月{today.day}日"
     year_str = str(today.year)
+
+    # 计算实施日期：与手册保持一致（按认证准备周期倒推），确保体系文件时间基准统一
+    if survey:
+        impl_date_str, impl_date_desc = calculate_implementation_date(survey)
+    else:
+        impl_date_str = today_str
+        impl_date_desc = "未提供调研原始数据，使用当前日期"
 
     system = (
         "你是程序文件智能生成助手。你会收到一份程序文件模板的结构概览（带段落索引P#、表格T#.R#、页眉H#、页脚F#）"
@@ -412,7 +525,13 @@ def build_llm_prompt(overview_text, survey_text, template_filename):
         "2. 文件编号：模板里的文件编号（如 AAA-XX-QP-XX）中的 AAA 替换为合适的公司简称，保留编号结构不变。\n"
         "3. 部门名称：根据模板所属部门，填入调研数据中对应的部门负责人姓名。\n"
         "4. 公司宗旨/质量方针/质量目标：如模板中有相关章节，用调研数据替换。\n"
-        "5. 实施日期：模板里的日期替换为" + today_str + "。\n"
+        "5. 实施日期（重要——已按认证准备周期倒推计算，与质量手册保持一致）：程序文件应与手册同步生效，\n"
+        "   根据证书类型和第一阶段开始时间倒推得出实施日期为 " + impl_date_str + "。\n"
+        "   【计算依据】" + impl_date_desc + "。\n"
+        "   模板里所有\"X年X月X日起实施\"、\"发布日期\"、\"生效日期\"、\"实施日期\"、\"制订日期\"、\"审查日期\"、\"批准日期\"等表达程序文件生效时间的日期，\n"
+        "   都要替换为 " + impl_date_str + "。\n"
+        "   注意：\"计划取得认证证书日期\"不要改，那是认证目标日期，不是程序文件的日期。\n"
+        "   程序文件的日期是体系开始运行的日期，必须与手册一致，早于认证日期。\n"
         "6. 人名：总经理/管理者代表/贯标办主任等姓名填入对应签字位置。\n"
         "7. 不要修改 IATF16949/ISO9001 标准条款内容。\n"
         "8. 如果调研数据某字段为空，跳过对应修改。\n"
@@ -429,12 +548,12 @@ def build_llm_prompt(overview_text, survey_text, template_filename):
         "    - 模板中所有出现的 AAA、AAA企业 必须替换为用户公司名\n"
         "    - 标题页/封面/页眉中的公司名必须替换\n"
         "    - 文件编号中的 AAA 必须替换（如 AAA-GM-QP-01 → 正和-GM-QP-01）\n"
-        "    - 日期必须替换为当前日期\n"
+        "    - 日期必须替换为实施日期（" + impl_date_str + "），不是当前日期\n"
         "    - 人名必须填入对应位置\n"
         "13. 优先使用 global_replace 做简单替换（如公司名、日期、编号中的AAA），只在需要整段重写时用 paragraph。\n"
         "14. 特别是 global_replace 要覆盖所有 AAA 变体：AAA、AAA企业、山东AAA 等，全部替换为用户公司名。\n"
         "15. 【封面表格填写】可以往封面表格（Table 0）的'实施日期/制订/审查/批准'下方的空单元格填写内容：\n"
-        "    - 实施日期下方填入当前日期（如 2026年7月11日）\n"
+        "    - 实施日期下方填入实施日期（" + impl_date_str + "）\n"
         "    - 制订/审查/批准下方填入对应人名（从调研数据获取）\n"
         "    - 填写内容简短即可，不要换行\n"
         "16. 【页眉页脚保护】不要删除或清空页眉页脚中的任何内容，只做替换：\n"
@@ -444,6 +563,7 @@ def build_llm_prompt(overview_text, survey_text, template_filename):
 
     user = (
         f"当前日期：{today_str}\n"
+        f"实施日期（倒推）：{impl_date_str}（{impl_date_desc}）\n"
         f"模板文件：{template_filename}\n\n"
         f"{survey_text}\n\n"
         f"{overview_text}\n\n"
