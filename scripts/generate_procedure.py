@@ -637,6 +637,8 @@ def replace_text_in_cell(cell, old, new):
 
 
 def apply_global_replace(doc, old, new):
+    if new is None:
+        new = ''
     if not old or old == new:
         return 0
     count = 0
@@ -669,6 +671,8 @@ def apply_global_replace(doc, old, new):
 
 
 def apply_header_replace(doc, old, new):
+    if new is None:
+        new = ''
     if not old or old == new:
         return 0
     count = 0
