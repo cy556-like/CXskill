@@ -193,7 +193,25 @@ def find_all_templates(agent_id=None, documents_dir=None):
 
 
 def convert_doc_to_docx(doc_path):
-    """用 LibreOffice 把 .doc 转成 .docx"""
+    """用 LibreOffice 把 .doc 转成 .docx
+
+    [Bug 修复] 解决 LibreOffice 超时问题：
+    1. 转换前杀掉僵尸 soffice 进程（避免锁冲突）
+    2. 超时从 120s 增加到 300s
+    3. 超时后重试一次
+    """
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/F', '/IM', 'soffice.exe'],
+                          capture_output=True, timeout=10)
+            subprocess.run(['taskkill', '/F', '/IM', 'soffice.bin'],
+                          capture_output=True, timeout=10)
+        else:
+            subprocess.run(['pkill', '-f', 'soffice'],
+                          capture_output=True, timeout=10)
+    except Exception:
+        pass
+
     tmp_dir = tempfile.mkdtemp(prefix='doc2docx_')
     soffice_paths = [
         'soffice', '/usr/bin/soffice',
@@ -201,20 +219,37 @@ def convert_doc_to_docx(doc_path):
         'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe',
     ]
     for sp in soffice_paths:
-        try:
-            result = subprocess.run(
-                [sp, '--headless', '--convert-to', 'docx',
-                 str(doc_path), '--outdir', tmp_dir],
-                capture_output=True, text=True, timeout=120
-            )
-            if result.returncode == 0:
-                basename = os.path.splitext(os.path.basename(str(doc_path)))[0]
-                converted = os.path.join(tmp_dir, basename + '.docx')
-                if os.path.exists(converted):
-                    print(f"[INFO] LibreOffice 转换成功")
-                    return converted
-        except Exception as e:
-            print(f"[WARN] LibreOffice ({sp}) 转换失败: {e}")
+        for attempt in range(2):
+            try:
+                result = subprocess.run(
+                    [sp, '--headless', '--convert-to', 'docx',
+                     str(doc_path), '--outdir', tmp_dir],
+                    capture_output=True, text=True, timeout=300
+                )
+                if result.returncode == 0:
+                    basename = os.path.splitext(os.path.basename(str(doc_path)))[0]
+                    converted = os.path.join(tmp_dir, basename + '.docx')
+                    if os.path.exists(converted):
+                        print(f"[INFO] LibreOffice 转换成功" + ("（重试后成功）" if attempt > 0 else ""))
+                        return converted
+                else:
+                    print(f"[WARN] LibreOffice ({sp}) 返回码 {result.returncode}: {result.stderr[:200] if result.stderr else ''}")
+                    break
+            except subprocess.TimeoutExpired:
+                print(f"[WARN] LibreOffice ({sp}) 超时（300s），{'重试中...' if attempt == 0 else '放弃'}")
+                try:
+                    if os.name == 'nt':
+                        subprocess.run(['taskkill', '/F', '/IM', 'soffice.exe'],
+                                      capture_output=True, timeout=10)
+                    else:
+                        subprocess.run(['pkill', '-f', 'soffice'],
+                                      capture_output=True, timeout=10)
+                except Exception:
+                    pass
+                continue
+            except Exception as e:
+                print(f"[WARN] LibreOffice ({sp}) 转换失败: {e}")
+                break
 
     try:
         import win32com.client
