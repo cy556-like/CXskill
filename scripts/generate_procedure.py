@@ -16,8 +16,10 @@ import re
 import subprocess
 import tempfile
 import shutil
+import signal
+import zipfile
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime
 
 
 def ensure_packages():
@@ -141,7 +143,7 @@ def find_all_templates(agent_id=None, documents_dir=None):
                     if f.startswith('~$'):
                         continue
                     ext = f.lower().rsplit('.', 1)[-1] if '.' in f else ''
-                    if ext in ('docx', 'doc'):
+                    if ext in ('docx', 'doc', 'xlsx'):
                         rel = os.path.relpath(root, str(proc_dir))
                         # 部门名取第一级子目录（如"质量部二级"），如果文件直接在根目录则 dept="通用"
                         parts = rel.replace('\\', '/').split('/')
@@ -149,6 +151,7 @@ def find_all_templates(agent_id=None, documents_dir=None):
                         internal_templates.append({
                             "path": Path(root) / f,
                             "need_convert": (ext == 'doc'),
+                            "file_type": ext,
                             "source": 'internal',
                             "dept": dept,
                             "filename": f
@@ -177,6 +180,7 @@ def find_all_templates(agent_id=None, documents_dir=None):
                     ext_templates.append({
                         "path": Path(root) / f,
                         "need_convert": (ext == 'doc'),
+                        "file_type": ext,
                         "source": 'external',
                         "dept": dept,
                         "filename": f
@@ -301,7 +305,7 @@ def _convert_doc_with_word(doc_path, tmp_dir):
     return None
 
 
-def convert_doc_to_docx(doc_path):
+def _legacy_convert_doc_to_docx(doc_path):
     """用 LibreOffice 把 .doc 转成 .docx，失败时在 Windows 上回退 Word COM。
 
     每次转换均使用一个临时、独立的 LibreOffice 用户配置目录，避免共享 profile
@@ -361,6 +365,481 @@ def convert_doc_to_docx(doc_path):
 # ===================================================================
 # 2. 提取模板结构概览
 # ===================================================================
+
+def _find_libreoffice_executables():
+    """返回当前机器真实存在的 LibreOffice 可执行文件，按路径去重。"""
+    candidates = []
+    configured = os.environ.get('LIBREOFFICE_PATH')
+    if configured:
+        candidates.append(configured)
+    for command in ('soffice', 'libreoffice'):
+        resolved = shutil.which(command)
+        if resolved:
+            candidates.append(resolved)
+    if os.name == 'nt':
+        for root in (
+            os.environ.get('ProgramW6432'),
+            os.environ.get('ProgramFiles'),
+            os.environ.get('ProgramFiles(x86)'),
+        ):
+            if root:
+                candidates.append(str(Path(root) / 'LibreOffice' / 'program' / 'soffice.exe'))
+    else:
+        candidates.extend((
+            '/usr/bin/soffice', '/usr/local/bin/soffice',
+            '/Applications/LibreOffice.app/Contents/MacOS/soffice',
+        ))
+    executables = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            normalized = str(Path(candidate).expanduser().resolve())
+        except (OSError, TypeError, ValueError):
+            continue
+        key = os.path.normcase(normalized)
+        if key not in seen and Path(normalized).is_file():
+            seen.add(key)
+            executables.append(normalized)
+    return executables
+
+
+def _terminate_process_tree(process):
+    """只终止本次转换启动的进程树，不影响其他用户的 LibreOffice。"""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        if os.name == 'nt':
+            subprocess.run(
+                ['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                capture_output=True, timeout=10,
+            )
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def _run_conversion_process(command, timeout):
+    """运行一次可控转换；超时时回收本次 PID 及其子进程。"""
+    kwargs = {
+        'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE,
+        'text': True, 'errors': 'replace',
+    }
+    if os.name == 'nt':
+        kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+    else:
+        kwargs['start_new_session'] = True
+    process = subprocess.Popen(command, **kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        try:
+            process.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
+
+
+def _validate_docx(path):
+    """确认产物是包含 Word 主文档的有效 OOXML 文件。"""
+    candidate = Path(path)
+    if not candidate.is_file() or candidate.stat().st_size <= 0:
+        return False
+    try:
+        with zipfile.ZipFile(candidate, 'r') as archive:
+            return 'word/document.xml' in archive.namelist()
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def _convert_with_libreoffice(
+    soffice_path, source_path, output_dir, output_ext='docx',
+    input_filter=None, timeout=75, attempt_name='direct',
+):
+    """用独立 profile、英文临时路径和明确过滤器执行一次转换。"""
+    source_path = Path(source_path)
+    output_dir = Path(output_dir)
+    profile_dir = output_dir / f'libreoffice-profile-{attempt_name}'
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    converted = output_dir / f'{source_path.stem}.{output_ext}'
+    try:
+        converted.unlink(missing_ok=True)
+    except OSError:
+        pass
+    export_filters = {'docx': 'Office Open XML Text', 'rtf': 'Rich Text Format'}
+    convert_spec = output_ext
+    if output_ext in export_filters:
+        convert_spec += ':' + export_filters[output_ext]
+    command = [
+        str(soffice_path),
+        f'-env:UserInstallation={profile_dir.resolve().as_uri()}',
+        '--headless', '--invisible', '--nologo', '--nodefault',
+        '--nofirststartwizard', '--norestore',
+    ]
+    if input_filter:
+        command.append(f'--infilter={input_filter}')
+    command.extend([
+        '--convert-to', convert_spec, '--outdir', str(output_dir), str(source_path),
+    ])
+    try:
+        result = _run_conversion_process(command, timeout)
+        if result.returncode == 0 and converted.is_file() and converted.stat().st_size > 0:
+            print(f'[INFO] LibreOffice 转换成功（{attempt_name}）')
+            return str(converted)
+        detail = (result.stderr or result.stdout or '').strip().replace('\n', ' ')
+        print(f'[WARN] LibreOffice ({soffice_path}) {attempt_name} 失败，返回码 {result.returncode}: {detail[:300]}')
+    except subprocess.TimeoutExpired:
+        print(f'[WARN] LibreOffice ({soffice_path}) {attempt_name} 超时（{timeout}s）')
+    except Exception as exc:
+        print(f'[WARN] LibreOffice ({soffice_path}) {attempt_name} 失败: {exc}')
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+    return None
+
+
+def _convert_via_rtf(soffice_path, source_path, output_dir):
+    """直接 DOCX 失败时，以 RTF 为中间格式修复旧 DOC 结构。"""
+    rtf_path = _convert_with_libreoffice(
+        soffice_path, source_path, output_dir,
+        output_ext='rtf', input_filter='MS Word 97', timeout=45,
+        attempt_name='doc-to-rtf',
+    )
+    if not rtf_path:
+        return None
+    return _convert_with_libreoffice(
+        soffice_path, rtf_path, output_dir,
+        output_ext='docx', input_filter='Rich Text Format', timeout=45,
+        attempt_name='rtf-to-docx',
+    )
+
+
+def _convert_with_word_com(doc_path, tmp_dir):
+    """Windows Word COM 最后兜底；使用独立实例并验证最终 DOCX。"""
+    pythoncom = None
+    word = None
+    source_doc = None
+    initialized = False
+    try:
+        import pythoncom as _pythoncom
+        import win32com.client
+        pythoncom = _pythoncom
+        pythoncom.CoInitialize()
+        initialized = True
+        word = win32com.client.DispatchEx('Word.Application')
+        word.Visible = False
+        word.DisplayAlerts = 0
+        source_doc = word.Documents.Open(str(doc_path), ReadOnly=True, AddToRecentFiles=False)
+        output = Path(tmp_dir) / 'converted.docx'
+        source_doc.SaveAs2(str(output), FileFormat=16)
+        if output.is_file() and output.stat().st_size > 0:
+            print('[INFO] Word COM 转换成功')
+            return str(output)
+    except Exception as exc:
+        print(f'[WARN] Word COM 转换失败: {exc}')
+    finally:
+        if source_doc is not None:
+            try:
+                source_doc.Close(SaveChanges=0)
+            except Exception:
+                pass
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+        if initialized and pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+    return None
+
+
+def convert_doc_to_docx(doc_path):
+    """将旧 DOC 可靠转换为 DOCX；成功返回临时路径，失败返回 None。"""
+    source = Path(doc_path)
+    tmp_dir = Path(tempfile.mkdtemp(prefix='doc2docx_'))
+    succeeded = False
+    try:
+        if not source.is_file():
+            print(f'[WARN] .doc 文件不存在，无法转换: {source}')
+            return None
+        # 旧格式过滤器在 Windows 上可能被中文/特殊字符路径卡住。
+        safe_source = tmp_dir / 'legacy_input.doc'
+        shutil.copy2(source, safe_source)
+        soffice_paths = _find_libreoffice_executables()
+        for soffice_path in soffice_paths:
+            converted = _convert_with_libreoffice(
+                soffice_path, safe_source, tmp_dir,
+                output_ext='docx', input_filter='MS Word 97', timeout=75,
+                attempt_name='word97-direct',
+            )
+            if converted and _validate_docx(converted):
+                succeeded = True
+                return converted
+            converted = _convert_via_rtf(soffice_path, safe_source, tmp_dir)
+            if converted and _validate_docx(converted):
+                print('[INFO] 旧 DOC 已通过 RTF 修复链转换为 DOCX')
+                succeeded = True
+                return converted
+        if not soffice_paths:
+            print('[WARN] 未找到可用的 LibreOffice，将尝试 Word COM')
+        converted = _convert_with_word_com(safe_source, tmp_dir)
+        if converted and _validate_docx(converted):
+            succeeded = True
+            return converted
+        if converted:
+            print('[WARN] Word COM 生成的文件不是有效 DOCX，已丢弃')
+        return None
+    finally:
+        if not succeeded:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def load_xlsx_workbook(xlsx_path):
+    """加载 XLSX 模板；保留公式，以便只修改输入数据。"""
+    from openpyxl import load_workbook
+    return load_workbook(str(xlsx_path), data_only=False)
+
+
+def _is_formula_cell(cell):
+    return cell.data_type == 'f' or (
+        isinstance(cell.value, str) and cell.value.startswith('=')
+    )
+
+
+def _iter_existing_xlsx_cells(worksheet):
+    """只遍历工作簿中真实存在的单元格，跳过被整列格式撑大的空白区域。"""
+    existing = getattr(worksheet, '_cells', None)
+    if isinstance(existing, dict):
+        return sorted(existing.values(), key=lambda cell: (cell.row, cell.column))
+    return (cell for row in worksheet.iter_rows() for cell in row)
+
+
+def build_xlsx_overview_chunks(
+    workbook, max_cells=160, max_cell_chars=12000, max_chunk_chars=40000,
+):
+    """分块返回所有非空、非公式单元格；不截断工作簿后半部分。"""
+    entries = []
+    for worksheet in workbook.worksheets:
+        for cell in _iter_existing_xlsx_cells(worksheet):
+            value = cell.value
+            if value is None or value == '' or _is_formula_cell(cell):
+                continue
+            if isinstance(value, datetime):
+                display_value = value.isoformat(sep=' ')
+                value_type = 'date'
+            else:
+                display_value = str(value)
+                value_type = cell.data_type or type(value).__name__
+            if len(display_value) > max_cell_chars:
+                half = max_cell_chars // 2
+                display_value = display_value[:half] + '\n...[内容过长，中间省略]...\n' + display_value[-half:]
+            entries.append({
+                'sheet': worksheet.title,
+                'cell': cell.coordinate,
+                'value_type': value_type,
+                'value': display_value,
+            })
+    chunks = []
+    lines = []
+    chars = 0
+    for item in entries:
+        line = json.dumps(item, ensure_ascii=False, separators=(',', ':'))
+        if lines and (len(lines) >= max_cells or chars + len(line) + 1 > max_chunk_chars):
+            chunks.append('\n'.join(lines))
+            lines = []
+            chars = 0
+        lines.append(line)
+        chars += len(line) + 1
+    if lines:
+        chunks.append('\n'.join(lines))
+    return chunks
+
+
+def build_xlsx_llm_prompt(
+    overview_text, survey_text, template_filename, survey=None,
+):
+    """构造程序文件 XLSX 的逐单元格 AI 检查提示词。"""
+    system = (
+        "你是一名 IATF 16949/ISO 9001 体系程序文件专家。请结合企业体系调研信息，"
+        "逐个检查 Excel 模板中本批次列出的每一个单元格，只对确实需要企业化的内容提出修改。\n\n"
+        "必须检查：公司名称、文件编号/代号、人员姓名、职务、部门名称、日期、地址、电话、"
+        "客户名称以及明显属于示例企业的占位内容。表格内容少也必须检查。\n"
+        "禁止修改：标准条款本身、通用制度要求、公式、工作表名称、行列结构、合并单元格和样式。"
+        "调研信息没有提供的字段不得臆造；new_value 必须保持原单元格的数据类型，日期使用 YYYY-MM-DD。\n\n"
+        "每行只输出一个 JSON 对象，可用格式：\n"
+        '{"type":"xlsx_cell","sheet":"工作表名","cell":"B2",'
+        '"new_value":"新值","reason":"原因"}\n'
+        '{"type":"xlsx_global_replace","old":"明确的旧占位文本",'
+        '"new":"新值","reason":"原因"}\n'
+        "xlsx_global_replace 只适合确定应在整个工作簿统一替换的完整旧文本；其余情况使用 xlsx_cell。\n"
+        "不得输出 markdown、解释或数组。没有修改时只输出 ===END===；最后一行必须输出 ===END===。"
+    )
+    user = (
+        f"文件名：{template_filename}\n\n"
+        f"=== 企业体系调研信息 ===\n{survey_text}\n\n"
+        f"=== 本批次 Excel 单元格（JSON 行） ===\n{overview_text}\n\n"
+        "请逐项核对后输出修改方案。"
+    )
+    return system, user
+
+
+def _xlsx_merged_anchor(worksheet, coordinate):
+    for merged_range in worksheet.merged_cells.ranges:
+        if coordinate in merged_range:
+            return worksheet.cell(
+                merged_range.min_row, merged_range.min_col
+            ).coordinate
+    return coordinate
+
+
+def _coerce_xlsx_value(old_value, new_value):
+    """尽量维持原单元格数据类型，避免日期/数字被保存成普通文本。"""
+    if not isinstance(new_value, str):
+        return new_value
+    text = new_value.strip()
+    if isinstance(old_value, datetime):
+        for candidate in (text, text.replace('/', '-')):
+            try:
+                return datetime.fromisoformat(candidate)
+            except ValueError:
+                continue
+    elif isinstance(old_value, date):
+        try:
+            return date.fromisoformat(text.replace('/', '-'))
+        except ValueError:
+            pass
+    elif isinstance(old_value, bool):
+        lowered = text.lower()
+        if lowered in ('true', 'yes', '1', '是'):
+            return True
+        if lowered in ('false', 'no', '0', '否'):
+            return False
+    elif isinstance(old_value, int):
+        try:
+            return int(text)
+        except ValueError:
+            pass
+    elif isinstance(old_value, float):
+        try:
+            return float(text)
+        except ValueError:
+            pass
+    return new_value
+
+
+def apply_xlsx_cell_replace(workbook, sheet_name, coordinate, new_value):
+    """更新一个非公式单元格的值，同时保留样式与数字格式。"""
+    if sheet_name not in workbook.sheetnames:
+        print(f"[WARN] XLSX 工作表不存在: {sheet_name}")
+        return False
+    worksheet = workbook[sheet_name]
+    try:
+        anchor = _xlsx_merged_anchor(worksheet, coordinate)
+        if anchor != coordinate:
+            print(f"[WARN] XLSX 单元格 {sheet_name}!{coordinate} 是合并区域非锚点，已跳过")
+            return False
+        cell = worksheet[coordinate]
+    except (KeyError, TypeError, ValueError):
+        print(f"[WARN] XLSX 单元格地址无效: {sheet_name}!{coordinate}")
+        return False
+    if _is_formula_cell(cell):
+        print(f"[WARN] XLSX 公式单元格禁止修改: {sheet_name}!{coordinate}")
+        return False
+    new_value = _coerce_xlsx_value(cell.value, new_value)
+    if cell.value == new_value:
+        return False
+    cell.value = new_value
+    return True
+
+
+def apply_xlsx_global_replace(workbook, old, new):
+    """替换文本单元格里的明确旧文本；公式和非字符串值不受影响。"""
+    if not isinstance(old, str) or not old or new is None or old == new:
+        return 0
+    count = 0
+    for worksheet in workbook.worksheets:
+        for cell in _iter_existing_xlsx_cells(worksheet):
+            if _is_formula_cell(cell) or not isinstance(cell.value, str):
+                continue
+            if old in cell.value:
+                cell.value = cell.value.replace(old, str(new))
+                count += 1
+    return count
+
+
+def apply_xlsx_modifications(workbook, modifications):
+    """全局替换优先，随后以精确单元格修改覆盖。"""
+    stats = {
+        'xlsx_cell': 0, 'xlsx_global_replace': 0,
+        'unknown': 0, 'failed': 0,
+    }
+    globals_seen = set()
+    global_modifications = []
+    cell_seen = set()
+    cell_modifications = []
+    for modification in modifications or []:
+        mod_type = modification.get('type')
+        if mod_type == 'xlsx_global_replace':
+            old = modification.get('old')
+            new = modification.get('new')
+            key = (str(old), json.dumps(new, ensure_ascii=False, sort_keys=True))
+            if old and key not in globals_seen:
+                globals_seen.add(key)
+                global_modifications.append(modification)
+        elif mod_type == 'xlsx_cell':
+            sheet = modification.get('sheet')
+            coordinate = str(modification.get('cell') or '').upper()
+            key = (sheet, coordinate)
+            if sheet and coordinate and key not in cell_seen:
+                cell_seen.add(key)
+                normalized = dict(modification)
+                normalized['cell'] = coordinate
+                cell_modifications.append(normalized)
+        else:
+            stats['unknown'] += 1
+    global_modifications.sort(key=lambda item: len(str(item.get('old') or '')), reverse=True)
+    for modification in global_modifications:
+        try:
+            stats['xlsx_global_replace'] += apply_xlsx_global_replace(
+                workbook, modification.get('old'), modification.get('new'),
+            )
+        except Exception as exc:
+            stats['failed'] += 1
+            print(f"[WARN] XLSX 全局替换失败: {exc}")
+    for modification in cell_modifications:
+        try:
+            if apply_xlsx_cell_replace(
+                workbook, modification.get('sheet'), modification.get('cell'),
+                modification.get('new_value'),
+            ):
+                stats['xlsx_cell'] += 1
+        except Exception as exc:
+            stats['failed'] += 1
+            print(f"[WARN] XLSX 单元格修改失败: {exc}")
+    return stats
+
+
+def save_xlsx_workbook(workbook, output_path):
+    """保存 XLSX，并要求 Excel 下次打开时重算公式。"""
+    calculation = getattr(workbook, 'calculation', None)
+    if calculation is not None:
+        for name, value in (
+            ('fullCalcOnLoad', True), ('forceFullCalc', True), ('calcMode', 'auto'),
+        ):
+            try:
+                setattr(calculation, name, value)
+            except Exception:
+                pass
+    workbook.save(str(output_path))
+    return str(output_path)
+
 
 def extract_template_overview(doc, max_paras=None):
     """提取模板的结构化概览"""
