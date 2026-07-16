@@ -15,6 +15,7 @@ import json
 import re
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -192,83 +193,169 @@ def find_all_templates(agent_id=None, documents_dir=None):
     return all_templates
 
 
-def convert_doc_to_docx(doc_path):
-    """用 LibreOffice 把 .doc 转成 .docx
+def _find_libreoffice_executable():
+    """返回一个可执行的 LibreOffice soffice 路径，未安装时返回 None。
 
-    [Bug 修复] 解决 LibreOffice 超时问题：
-    1. 转换前杀掉僵尸 soffice 进程（避免锁冲突）
-    2. 超时从 120s 增加到 300s
-    3. 超时后重试一次
+    不直接调用字符串形式的 ``soffice``，以免在 Windows 上对每个文件产生
+    ``WinError 2`` 日志；也不猜测或终止其他请求正在使用的 LibreOffice 进程。
     """
-    try:
-        if os.name == 'nt':
-            subprocess.run(['taskkill', '/F', '/IM', 'soffice.exe'],
-                          capture_output=True, timeout=10)
-            subprocess.run(['taskkill', '/F', '/IM', 'soffice.bin'],
-                          capture_output=True, timeout=10)
-        else:
-            subprocess.run(['pkill', '-f', 'soffice'],
-                          capture_output=True, timeout=10)
-    except Exception:
-        pass
+    candidates = []
+    configured = os.environ.get('LIBREOFFICE_PATH')
+    if configured:
+        candidates.append(configured)
 
-    tmp_dir = tempfile.mkdtemp(prefix='doc2docx_')
-    soffice_paths = [
-        'soffice', '/usr/bin/soffice',
-        'C:\\Program Files\\LibreOffice\\program\\soffice.exe',
-        'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe',
-    ]
-    for sp in soffice_paths:
-        for attempt in range(2):
-            try:
-                result = subprocess.run(
-                    [sp, '--headless', '--convert-to', 'docx',
-                     str(doc_path), '--outdir', tmp_dir],
-                    capture_output=True, text=True, timeout=300
-                )
-                if result.returncode == 0:
-                    basename = os.path.splitext(os.path.basename(str(doc_path)))[0]
-                    converted = os.path.join(tmp_dir, basename + '.docx')
-                    if os.path.exists(converted):
-                        print(f"[INFO] LibreOffice 转换成功" + ("（重试后成功）" if attempt > 0 else ""))
-                        return converted
-                else:
-                    print(f"[WARN] LibreOffice ({sp}) 返回码 {result.returncode}: {result.stderr[:200] if result.stderr else ''}")
-                    break
-            except subprocess.TimeoutExpired:
-                print(f"[WARN] LibreOffice ({sp}) 超时（300s），{'重试中...' if attempt == 0 else '放弃'}")
-                try:
-                    if os.name == 'nt':
-                        subprocess.run(['taskkill', '/F', '/IM', 'soffice.exe'],
-                                      capture_output=True, timeout=10)
-                    else:
-                        subprocess.run(['pkill', '-f', 'soffice'],
-                                      capture_output=True, timeout=10)
-                except Exception:
-                    pass
-                continue
-            except Exception as e:
-                print(f"[WARN] LibreOffice ({sp}) 转换失败: {e}")
-                break
+    for command in ('soffice', 'libreoffice'):
+        resolved = shutil.which(command)
+        if resolved:
+            candidates.append(resolved)
+
+    if os.name == 'nt':
+        program_files = [
+            os.environ.get('ProgramFiles'),
+            os.environ.get('ProgramFiles(x86)'),
+            r'C:\Program Files',
+            r'C:\Program Files (x86)',
+        ]
+        for root in program_files:
+            if root:
+                candidates.append(os.path.join(root, 'LibreOffice', 'program', 'soffice.exe'))
+    else:
+        candidates.extend(('/usr/bin/soffice', '/usr/local/bin/soffice'))
+
+    seen = set()
+    for candidate in candidates:
+        candidate = os.path.expandvars(os.path.expanduser(candidate))
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _cleanup_conversion_temp_dir(tmp_dir):
+    """尽力清理一次失败转换留下的输出目录和独立 LO 配置目录。"""
+    try:
+        shutil.rmtree(tmp_dir)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        # 转换结果不可用时不应让清理异常掩盖原始转换错误。
+        print(f"[WARN] 转换临时目录清理失败 ({tmp_dir}): {exc}")
+
+
+def _convert_doc_with_word(doc_path, tmp_dir):
+    """在 Windows 上使用独立 Word COM 实例进行兜底转换。"""
+    word = None
+    source_doc = None
+    pythoncom = None
+    com_initialized = False
+    output_path = os.path.join(tmp_dir, 'converted.docx')
 
     try:
         import win32com.client
-        import pythoncom
+        import pythoncom as _pythoncom
+
+        pythoncom = _pythoncom
         pythoncom.CoInitialize()
-        word = win32com.client.Dispatch("Word.Application")
+        com_initialized = True
+
+        # DispatchEx 创建本次转换专用实例，避免关闭已有用户打开的 Word。
+        dispatch = getattr(win32com.client, 'DispatchEx', win32com.client.Dispatch)
+        word = dispatch('Word.Application')
         word.Visible = False
-        d = word.Documents.Open(str(doc_path))
-        out = os.path.join(tmp_dir, 'converted.docx')
-        d.SaveAs2(out, FileFormat=16)
-        d.Close()
-        word.Quit()
-        pythoncom.CoUninitialize()
-        print(f"[INFO] Word COM 转换成功")
-        return out
-    except Exception as e:
-        print(f"[WARN] Word COM 转换失败: {e}")
+        try:
+            word.DisplayAlerts = 0
+        except Exception:
+            pass
+
+        source_doc = word.Documents.Open(str(Path(doc_path).resolve()), ReadOnly=True)
+        source_doc.SaveAs2(output_path, FileFormat=16)
+        if os.path.exists(output_path):
+            print("[INFO] Word COM 转换成功")
+            return output_path
+        print("[WARN] Word COM 未生成转换后的 .docx 文件")
+    except Exception as exc:
+        print(f"[WARN] Word COM 转换失败: {exc}")
+    finally:
+        if source_doc is not None:
+            try:
+                source_doc.Close(False)
+            except Exception:
+                try:
+                    source_doc.Close()
+                except Exception:
+                    pass
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+        if com_initialized and pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
     return None
+
+
+def convert_doc_to_docx(doc_path):
+    """用 LibreOffice 把 .doc 转成 .docx，失败时在 Windows 上回退 Word COM。
+
+    每次转换均使用一个临时、独立的 LibreOffice 用户配置目录，避免共享 profile
+    锁造成卡死。不会再 ``taskkill``/``pkill`` 全局 soffice 进程，也不会进行会把
+    其他并发转换杀掉的重试。成功时保留返回文件所在临时目录供调用方继续读取；
+    失败时会在返回 ``None`` 前清理该目录。
+    """
+    tmp_dir = tempfile.mkdtemp(prefix='doc2docx_')
+    converted = None
+
+    try:
+        soffice = _find_libreoffice_executable()
+        if soffice:
+            profile_dir = Path(tmp_dir) / 'libreoffice-profile'
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            profile_uri = profile_dir.resolve().as_uri()
+            expected_output = os.path.join(
+                tmp_dir, Path(doc_path).stem + '.docx'
+            )
+            try:
+                result = subprocess.run(
+                    [
+                        soffice,
+                        f'-env:UserInstallation={profile_uri}',
+                        '--headless', '--convert-to', 'docx',
+                        '--outdir', tmp_dir, str(doc_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    errors='replace',
+                    timeout=120,
+                )
+                if result.returncode == 0 and os.path.exists(expected_output):
+                    print('[INFO] LibreOffice 转换成功')
+                    converted = expected_output
+                elif result.returncode == 0:
+                    print('[WARN] LibreOffice 未生成预期的 .docx 文件')
+                else:
+                    stderr = (result.stderr or '').strip().replace('\n', ' ')
+                    print(f'[WARN] LibreOffice ({soffice}) 返回码 {result.returncode}: {stderr[:200]}')
+            except subprocess.TimeoutExpired:
+                # subprocess.run 只终止当前启动的进程，不会影响其他用户的转换。
+                print(f'[WARN] LibreOffice ({soffice}) 转换超时（120s），将尝试 Word COM 兜底')
+            except Exception as exc:
+                print(f'[WARN] LibreOffice ({soffice}) 转换失败: {exc}')
+        else:
+            print('[WARN] 未找到 LibreOffice soffice 可执行文件，将尝试 Word COM 兜底')
+
+        if converted is None:
+            converted = _convert_doc_with_word(doc_path, tmp_dir)
+        return converted
+    finally:
+        if converted is None:
+            _cleanup_conversion_temp_dir(tmp_dir)
 
 
 # ===================================================================
@@ -331,6 +418,13 @@ def extract_template_overview(doc, max_paras=None):
             for p in hf.paragraphs:
                 if p.text.strip():
                     texts.append(p.text.strip())
+            # 页脚中的文件编号、公司名和版次通常位于表格内。若不把它们送入
+            # LLM 概览，模型既看不到内容，也无法生成 header_replace 方案。
+            for t in hf.tables:
+                for row in t.rows:
+                    for c in row.cells:
+                        if c.text.strip():
+                            texts.append(c.text.strip().replace('\n', ' | '))
             if texts:
                 overview["footers"].append({
                     "section": si, "type": hf_name, "text": " | ".join(texts)[:300]
@@ -655,13 +749,78 @@ def set_paragraph_text(p, new_text):
 
 
 def replace_text_in_paragraph(p, old, new):
-    if not p.runs or old not in p.text:
+    """替换段落文字，同时保留不受影响 run 的原有格式。
+
+    Word 经常把一个公司名拆到多个 run 中。直接重设整段文字虽然能替换成功，
+    但会把加粗、斜体、颜色、字段等格式全部塞进第一个 run。这里按字符区间从
+    后向前修改，只把命中的 run 内容改为新文本；未命中的 run 完全不动。
+    """
+    if not p.runs or not old:
         return False
-    full = p.text
-    new_full = full.replace(old, new)
-    if new_full == full:
+
+    old = str(old)
+    new = '' if new is None else str(new)
+    run_texts = [(run.text or '') for run in p.runs]
+    full = ''.join(run_texts)
+    if old not in full:
         return False
-    set_paragraph_text(p, new_full)
+
+    # 每个 run 在拼接字符串中的半开区间 [start, end)。空 run 没有字符，
+    # 因而不会作为一次匹配的起点或终点，但它本身的格式也不会被改动。
+    spans = []
+    offset = 0
+    for run_index, text in enumerate(run_texts):
+        end = offset + len(text)
+        spans.append((offset, end, run_index))
+        offset = end
+
+    matches = []
+    search_from = 0
+    while True:
+        start = full.find(old, search_from)
+        if start < 0:
+            break
+        matches.append((start, start + len(old)))
+        search_from = start + len(old)
+
+    def _run_for_start(char_offset):
+        for run_start, run_end, run_index in spans:
+            if run_start <= char_offset < run_end:
+                return run_start, run_end, run_index
+        return None
+
+    def _run_for_end(char_offset):
+        for run_start, run_end, run_index in spans:
+            if run_start < char_offset <= run_end:
+                return run_start, run_end, run_index
+        return None
+
+    # 从后向前处理，前面的原始字符偏移不会被后面的替换长度改变。
+    for match_start, match_end in reversed(matches):
+        start_run = _run_for_start(match_start)
+        end_run = _run_for_end(match_end)
+        if start_run is None or end_run is None:
+            # 正常 run 文本不可能走到这里；保守跳过，避免破坏文档。
+            continue
+
+        start_offset, _, start_index = start_run
+        end_offset, _, end_index = end_run
+        start_text = p.runs[start_index].text or ''
+        prefix = start_text[:match_start - start_offset]
+
+        if start_index == end_index:
+            suffix = start_text[match_end - start_offset:]
+            p.runs[start_index].text = prefix + new + suffix
+            continue
+
+        end_text = p.runs[end_index].text or ''
+        suffix = end_text[match_end - end_offset:]
+        # 新文字继承命中起点 run 的格式；匹配两端之外的文字仍留在各自原 run。
+        p.runs[start_index].text = prefix + new
+        for run_index in range(start_index + 1, end_index):
+            p.runs[run_index].text = ''
+        p.runs[end_index].text = suffix
+
     return True
 
 
@@ -780,7 +939,28 @@ def apply_modifications(doc, modifications):
         'paragraph': 0, 'table_cell': 0, 'global_replace': 0,
         'header_replace': 0, 'unknown': 0, 'failed': 0,
     }
+
+    # AI 有时会先给出 AAA -> 新公司名，再给 AAA企业 -> 新公司名。若按原顺序
+    # 执行，前一次会把后一次的目标改成“新公司名企业”。所有全文/页眉页脚替换
+    # 均按旧文本长度从长到短执行，避免短文本抢先吞掉长文本。其余修改仍保持原序。
+    replacement_mods = []
+    other_mods = []
     for i, mod in enumerate(modifications):
+        if isinstance(mod, dict) and mod.get('type') in ('global_replace', 'header_replace'):
+            replacement_mods.append((i, mod))
+        else:
+            other_mods.append((i, mod))
+
+    def _old_text_length(item):
+        old = item[1].get('old', '')
+        return len(old) if isinstance(old, str) else len(str(old or ''))
+
+    ordered_mods = sorted(
+        replacement_mods,
+        key=lambda item: (-_old_text_length(item), item[0])
+    ) + other_mods
+
+    for i, mod in ordered_mods:
         try:
             mod_type = mod.get('type', '')
             reason = (mod.get('reason', '') or '')[:80]
@@ -823,27 +1003,11 @@ def apply_modifications(doc, modifications):
 
 
 def remove_even_page_headers_footers(doc):
-    """删除偶数页页眉页脚引用"""
-    from docx.oxml.ns import qn
-    removed = 0
+    """兼容保留的无操作函数：不再删除奇偶页页眉/页脚引用。
 
-    # 删除偶数页引用
-    for sec in doc.sections:
-        sectPr = sec._sectPr
-        for ref in sectPr.findall(qn('w:headerReference')):
-            ref_type = ref.get(qn('w:type'))
-            if ref_type == 'even':
-                sectPr.remove(ref)
-                removed += 1
-                print(f"[INFO] 删除偶数页页眉引用")
-        for ref in sectPr.findall(qn('w:footerReference')):
-            ref_type = ref.get(qn('w:type'))
-            if ref_type == 'even':
-                sectPr.remove(ref)
-                removed += 1
-                print(f"[INFO] 删除偶数页页脚引用")
-
-    # 注意：之前的"修复空白页"逻辑（把 sectPr 从 P0 移到 P1 并删除 P0）已被移除
-    # 因为它会把节分界符合并到内容段落，导致页眉引用错乱、第2页大量空白
-
-    return removed
+    质量体系文件常用不同的偶数页页眉或页脚。过去为了规避个别模板的空白页而
+    删除 ``even`` 引用，会静默破坏所有正常的镜像页版式。调用方可以继续调用
+    本函数，但它现在保证不修改文档并始终返回 0。
+    """
+    del doc
+    return 0
